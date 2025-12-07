@@ -48,6 +48,9 @@ services:
 
       # 時區
       TZ: Asia/Taipei
+      
+      # 把 zombie 判定改成 20 分鐘
+      AIRFLOW__SCHEDULER__SCHEDULER_ZOMBIE_TASK_THRESHOLD: 1200
 
     # 掛載專案、DAG、logs、plugins
     volumes:

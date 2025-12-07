@@ -23,13 +23,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]  # CE_interview/
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.config.settings import (
-    DATA_ROOT,
-    RAW_ROOT,
-    CLEAN_ROOT,
-    PARQUET_ENGINE,
-    VALID_MODELS,
-)
+from src.config.settings import DATA_ROOT, RAW_ROOT, CLEAN_ROOT, PARQUET_ENGINE, VALID_MODELS, FEATURE_ROOT
 from src.ingestion.ingest import EventLogRawIngestor
 from src.cleaning.clean import EventLogCleaner
 from src.feature.feature import EventLogFeatureEngineer
@@ -148,13 +142,12 @@ with DAG(
                 建 device-level 特徵、error 時序資料
                 寫入 feature zone: s3/feature/event_log/...
         """
-        feature_root = PROJECT_ROOT / "s3" / "feature" / "event_log"
         logger.info(
-            f"[FEATURE] start | CLEAN_ROOT={CLEAN_ROOT}, FEATURE_ROOT={feature_root}, " f"ENGINE={PARQUET_ENGINE}"
+            f"[FEATURE] start | CLEAN_ROOT={CLEAN_ROOT}, FEATURE_ROOT={FEATURE_ROOT}, " f"ENGINE={PARQUET_ENGINE}"
         )
         engineer = EventLogFeatureEngineer(
             clean_root=CLEAN_ROOT,
-            feature_root=str(feature_root),
+            feature_root=FEATURE_ROOT,
             parquet_engine=PARQUET_ENGINE,
         )
         engineer.run()
