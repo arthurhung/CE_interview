@@ -1,396 +1,328 @@
-# CE_interview
+# 📘 **Event Log Data Pipeline — 技術設計文件（面試用）**
 
+## 📌 目錄
 
-# Event Log Data Pipeline
-
-收集與分析 end user 筆電的 event log（開機、BIOS 更新、當機…），透過 Data Pipeline + Feature Engineering，協助 Data Scientist 進行異常偵測與設備健康度分析。
-
----
-
-## 1. 專案目標與資料說明
-
-**專案目的**
-
-* 從 OEM 端收集每台筆電的 event log
-* 透過資料清洗、去重與特徵工程，輸出「可直接被 Data Scientist 使用」的分析資料
-* 支援後續做：
-  * 異常筆電偵測（Anomaly Detection）
-  * 設備穩定性評估
-  * Error pattern / burst 分析
-
-**資料特性**
-
-* 來源：OEM Portal / Agent 上報
-* 期間：兩週 sample data（`weeks = ['2024-05-10', '2024-05-17']`）
-* 機種：`L5`, `I13`, `DG5` 三種，外加未知機種
-* 主 key：`service_tag`（每台筆電唯一 ID）
-* 主要欄位：
-  * `eventdate`, `ts`：時間欄位（其中一個為 epoch 型態）
-  * `ev`：內含 JSON 的字串，包含 `TimeStamp`, `LogTime`, `EventId`, `Cat` (Error/Warning/Info...) 等
-* 資料品質問題：
-  * 不同週會重送重複資料
-  * 時間欄位不一致：`TimeStamp`, `LogTime`, `ts`, `eventdate` 可能缺漏或格式不一
+1. Pipeline 架構概述
+2. End-to-End 流程設計
+3. Raw / Clean / Feature 儲存策略與命名規則
+4. 技術選擇說明（為何 Pandas + Airflow）
+5. 數據品質與效能指標（DQ + SLA 指標）
+6. 硬體與資源需求評估（sample 400 萬筆 → production 1,200 萬筆）
+7. 監控機制設計（Monitoring & Alert）
+8. 成本評估：雲端 vs 地端
+9. CICD 與部署流程（DevOps / MLOps）
 
 ---
 
-## 2. 架構與 End-to-End 流程設計
+# 1️⃣ **Pipeline 架構概述**
 
-整體分成四層：**Raw → Clean → Feature → Analysis**
+事件日誌（event log）來源為 end-user 的筆電回傳訊息。
 
-<pre class="overflow-visible!" data-start="884" data-end="1857"><div class="contain-inline-size rounded-2xl corner-superellipse/1.1 relative bg-token-sidebar-surface-primary"><div class="sticky top-9"><div class="absolute end-0 bottom-0 flex h-9 items-center pe-2"><div class="bg-token-bg-elevated-secondary text-token-text-secondary flex items-center gap-4 rounded-sm px-2 font-sans text-xs"></div></div></div><div class="overflow-y-auto p-4" dir="ltr"><code class="whitespace-pre! language-text"><span><span>        +----------------+
-        |   OEM Portal   |
-        +--------+-------+
-                 |
-                 v
-        (local mount / fake S3)
-        data/2024-05-10/*.parquet
-        data/2024-05-17/*.parquet
+資料包含：
 
-                 |
-                 |  Ingestion (EventLogRawSaver)
-                 v
-s3/raw/event_log/week=YYYY-MM-DD/pn=PN_VALUE/*.parquet
-        - 只做基本欄位補齊 + partition
-        - 保留原始 log，不做破壞性變更
+* event 的 JSON 結構
+* 多個時間欄位（TimeStamp / LogTime / ts / eventdate）
+* 資料品質議題：重複、欄位缺失、時間異常
 
-                 |
-                 |  Cleaning (EventLogCleaner)
-                 v
-s3/clean/event_log/week=YYYY-MM-DD/pn=PN_VALUE/*.parquet
-        - 解析 ev JSON
-        - 計算 valid_timestamp
-        - 產生 event_key
-        - 依 service_tag + event_key 去重
+本 pipeline 的目標：
 
-                 |
-                 |  Feature Engineering (EventLogFeatureEngineer)
-                 v
-s3/feature/event_log/
-   ├─ device_features.parquet   (每台筆電一筆)
-   └─ error_events.parquet      (error 級別時序資料)
+* 整理 raw → clean → feature
+* 提供可供 Data Scientist 分析「異常設備（anomaly device）」的資料集
+* 可擴展、可監控、可維運
 
-                 |
-                 v
-        Data Scientist 分析 / 模型開發
+---
+
+
+
+# 2️⃣ **End-to-End 流程設計**
+
+整體流程由 Airflow DAG orchestrate：
+
+<pre class="overflow-visible!" data-start="995" data-end="1057"><div class="contain-inline-size rounded-2xl corner-superellipse/1.1 relative bg-token-sidebar-surface-primary"><div class="sticky top-9"><div class="absolute end-0 bottom-0 flex h-9 items-center pe-2"><div class="bg-token-bg-elevated-secondary text-token-text-secondary flex items-center gap-4 rounded-sm px-2 font-sans text-xs"></div></div></div><div class="overflow-y-auto p-4" dir="ltr"><code class="whitespace-pre!"><span><span>[1]</span><span> Ingestion → </span><span>[2]</span><span> Cleaning → </span><span>[3]</span><span> Feature Engineering
 </span></span></code></div></div></pre>
 
-**Orchestration**
+### **(1) Ingestion（Raw Zone）**
 
-使用 Airflow DAG `event_log_pipeline` 串起整個流程：
+來源：題目提供的 parquet（sample size：400 萬筆）
 
-1. `ingest_raw_data` → 讀 `data/`，寫入 raw zone
-2. `clean_event_log` → 讀 raw，寫入 clean zone
-3. `build_features` → 讀 clean，寫入 feature zone
+主要工作：
 
----
+* 將 data/YYYY-MM-DD/*.parquet
 
-## 3. 儲存策略、命名規則與分層架構
+  轉換成 lakehouse-style partition：
 
-### 3.1 Fake S3 / Data Lake Layout
-
-為了模擬未來上雲（如 S3 / Data Lakehouse）的型態，我採用  **S3-style 分區目錄** ：
-
-#### Raw Layer
-
-<pre class="overflow-visible!" data-start="2196" data-end="2485"><div class="contain-inline-size rounded-2xl corner-superellipse/1.1 relative bg-token-sidebar-surface-primary"><div class="sticky top-9"><div class="absolute end-0 bottom-0 flex h-9 items-center pe-2"><div class="bg-token-bg-elevated-secondary text-token-text-secondary flex items-center gap-4 rounded-sm px-2 font-sans text-xs"></div></div></div><div class="overflow-y-auto p-4" dir="ltr"><code class="whitespace-pre! language-text"><span><span>s3/raw/event_log/
-  └─ week=2024-05-10/
-      ├─ pn=I13/
-      │   ├─ 2024-05-10_I13.parquet
-      │   ├─ 2024-05-10_I13_1.parquet
-      ├─ pn=L5/
-      │   └─ 2024-05-10_L5.parquet
-      └─ pn=UNKNOWN/
-          └─ 2024-05-10_UNKNOWN.parquet
-  └─ week=2024-05-17/
-      └─ ...
+<pre class="overflow-visible!" data-start="1203" data-end="1327"><div class="contain-inline-size rounded-2xl corner-superellipse/1.1 relative bg-token-sidebar-surface-primary"><div class="sticky top-9"><div class="absolute end-0 bottom-0 flex h-9 items-center pe-2"><div class="bg-token-bg-elevated-secondary text-token-text-secondary flex items-center gap-4 rounded-sm px-2 font-sans text-xs"></div></div></div><div class="overflow-y-auto p-4" dir="ltr"><code class="whitespace-pre!"><span><span>s3/raw/event_log/
+    week=2024-05-10/
+        pn=I13/*.parquet
+        pn=L5/*.parquet
+        pn=UNKNOWN/*.parquet
 </span></span></code></div></div></pre>
 
-**設計理由**
+為什麼照週、機種分：
 
-* `week=...`、`pn=...` 採 **key=value** 命名：
-  * 和 Hive / Spark / Trino 等常見查詢引擎兼容
-  * Query 時可以直接用 partition pruning（例如：只讀某週 / 某機種）
-* `pn` 未知或不在 `VALID_MODELS = {I13, L5, DG5}` 內 → 落在 `pn=UNKNOWN`：
-  * 讓資料不會消失
-  * 後續可針對 UNKNOWN 進行追蹤與修補
-* 檔案格式：**Parquet**
-  * 壓縮好（節省儲存空間）
-  * columnar 格式對後續分析友善
-  * 與 Pandas / Spark / DuckDB 完全相容
+* Data Scientist 查詢時可快速 filter（節省 I/O）
+* 後續如升級至 Spark / Iceberg 也相容 Hive partition 規則
 
-#### Clean Layer
+---
 
-<pre class="overflow-visible!" data-start="2842" data-end="2995"><div class="contain-inline-size rounded-2xl corner-superellipse/1.1 relative bg-token-sidebar-surface-primary"><div class="sticky top-9"><div class="absolute end-0 bottom-0 flex h-9 items-center pe-2"><div class="bg-token-bg-elevated-secondary text-token-text-secondary flex items-center gap-4 rounded-sm px-2 font-sans text-xs"></div></div></div><div class="overflow-y-auto p-4" dir="ltr"><code class="whitespace-pre! language-text"><span><span>s3/clean/event_log/
-  └─ week=2024-05-10/
-      ├─ pn=I13/2024-05-10_I13.parquet
-      ├─ pn=L5/2024-05-10_L5.parquet
-      └─ pn=UNKNOWN/...
+### **(2) Cleaning（Clean Zone）**
+
+處理資料品質問題：
+
+#### ✔ 找出每筆 event log 的合理發生時間 `valid_timestamp`
+
+優先順序：
+
+<pre class="overflow-visible!" data-start="1533" data-end="1593"><div class="contain-inline-size rounded-2xl corner-superellipse/1.1 relative bg-token-sidebar-surface-primary"><div class="sticky top-9"><div class="absolute end-0 bottom-0 flex h-9 items-center pe-2"><div class="bg-token-bg-elevated-secondary text-token-text-secondary flex items-center gap-4 rounded-sm px-2 font-sans text-xs"></div></div></div><div class="overflow-y-auto p-4" dir="ltr"><code class="whitespace-pre!"><span><span>ev</span><span>.TimeStamp</span><span> → ev</span><span>.LogTime</span><span> → ts → </span><span>eventdate</span><span>(epoch ns)
 </span></span></code></div></div></pre>
 
-* 保留與 raw 相同 partition key（`week`, `pn`），方便交叉比對 row count
-* 新增欄位：
-  * `valid_timestamp`
-  * `event_key`
-  * `cat`（從 ev JSON 抽出）
+#### ✔ event_key 去重（以設備 + 事件內容）
 
-#### Feature Layer
+規則：
 
-<pre class="overflow-visible!" data-start="3146" data-end="3285"><div class="contain-inline-size rounded-2xl corner-superellipse/1.1 relative bg-token-sidebar-surface-primary"><div class="sticky top-9"><div class="absolute end-0 bottom-0 flex h-9 items-center pe-2"><div class="bg-token-bg-elevated-secondary text-token-text-secondary flex items-center gap-4 rounded-sm px-2 font-sans text-xs"></div></div></div><div class="overflow-y-auto p-4" dir="ltr"><code class="whitespace-pre! language-text"><span><span>s3/feature/event_log/
-  ├─ device_features.parquet    # 每台 service_tag 一筆
-  └─ error_events.parquet       # 只保留 error log 的時序資料
+* 若 ev 中有 TimeStamp → 去除指定欄位後，用 hash(payload)
+* 無 TimeStamp → 用 ev.EventId
+
+重點：
+
+* `valid_timestamp is null → 不去重`
+* `valid_timestamp is not null → group by service_tag + event_key → 保留最早時間`
+
+#### 輸出格式：
+
+<pre class="overflow-visible!" data-start="1837" data-end="1923"><div class="contain-inline-size rounded-2xl corner-superellipse/1.1 relative bg-token-sidebar-surface-primary"><div class="sticky top-9"><div class="absolute end-0 bottom-0 flex h-9 items-center pe-2"><div class="bg-token-bg-elevated-secondary text-token-text-secondary flex items-center gap-4 rounded-sm px-2 font-sans text-xs"></div></div></div><div class="overflow-y-auto p-4" dir="ltr"><code class="whitespace-pre!"><span><span>s3/clean/event_log/
+    week=2024-05-10/
+        pn=I13/2024-05-10_I13.parquet
 </span></span></code></div></div></pre>
 
-* feature 資料量已大幅縮減，暫不再做 partition
-* 若資料持續增加，可再分成：
-  * `week=.../device_features.parquet`
-  * `week=.../error_events.parquet`
-
 ---
 
-## 4. 各階段實作與技術選擇
+### **(3) Feature Engineering（Feature Zone）**
 
-### 4.1 Ingestion：EventLogRawSaver
+Data Scientist 需要：
 
- **位置** ：`src/ingestion/ingest.py`
+* 有 Error 的事件
+* 時序特徵（事件時間差、Error 次數）
+* 設備層級特徵（每日 / 每週 event count）
 
- **類別** ：`EventLogRawSaver`
+我輸出三種特徵檔：
 
-**邏輯**
-
-1. 掃描 `DATA_ROOT` 底下的週目錄，例如：
-   <pre class="overflow-visible!" data-start="3574" data-end="3646"><div class="contain-inline-size rounded-2xl corner-superellipse/1.1 relative bg-token-sidebar-surface-primary"><div class="sticky top-9"><div class="absolute end-0 bottom-0 flex h-9 items-center pe-2"><div class="bg-token-bg-elevated-secondary text-token-text-secondary flex items-center gap-4 rounded-sm px-2 font-sans text-xs"></div></div></div><div class="overflow-y-auto p-4" dir="ltr"><code class="whitespace-pre! language-text"><span><span>data/2024-05-10/*.parquet
-   data/2024-05-17/*.parquet
-   </span></span></code></div></div></pre>
-2. 讀入每週全部 Parquet，補上 `week` 欄位。
-3. 清洗 `pn` 欄位：
-   * 缺失或不在 `{I13, L5, DG5}` 內 → 設為 `"UNKNOWN"`
-4. 依 `week`, `pn` 分組，寫回：
-   <pre class="overflow-visible!" data-start="3769" data-end="3827"><div class="contain-inline-size rounded-2xl corner-superellipse/1.1 relative bg-token-sidebar-surface-primary"><div class="sticky top-9"><div class="absolute end-0 bottom-0 flex h-9 items-center pe-2"><div class="bg-token-bg-elevated-secondary text-token-text-secondary flex items-center gap-4 rounded-sm px-2 font-sans text-xs"></div></div></div><div class="overflow-y-auto p-4" dir="ltr"><code class="whitespace-pre! language-text"><span><span>s3/raw/event_log/week={week}/pn={pn}/...
-   </span></span></code></div></div></pre>
-5. 若同一 `(week, pn)` 多次執行（重跑），自動在檔名加 `_1`, `_2` 避免覆蓋。
-
-**技術選擇理由**
-
-* 用  **PyArrow / Pandas** ：
-  * 開發速度快、容易 debug
-  * 對於目前等級的資料量（數百萬列）足夠
-* Partition 設計提前與日後 Spark / BigQuery 的使用習慣對齊，便於未來擴展。
-
----
-
-### 4.2 Cleaning：EventLogCleaner
-
- **位置** ：`src/cleaning/clean.py`
-
- **類別** ：`EventLogCleaner`
-
-#### 4.2.1 解析 `ev` JSON
-
-* 使用 `orjson` / `json` 將 `ev` 轉成 dict
-* 抽出欄位：
-  * `TimeStamp`
-  * `LogTime`
-  * `EventId` / `eventID`
-  * `Cat`（記錄 error / warning / info）
-
-#### 4.2.2 計算 `valid_timestamp`
-
-時間欄位優先順序：
-
-1. `ev.TimeStamp`
-2. `ev.LogTime`
-3. `ts`
-4. `eventdate`（epoch，需除以 1e9 再轉成秒）
-
-實作：
-
-* 用 `pd.to_datetime(..., errors="coerce")` 將各欄位轉成 datetime
-* 按優先順序用 `fillna` 合併：
-  <pre class="overflow-visible!" data-start="4489" data-end="4570"><div class="contain-inline-size rounded-2xl corner-superellipse/1.1 relative bg-token-sidebar-surface-primary"><div class="sticky top-9"><div class="absolute end-0 bottom-0 flex h-9 items-center pe-2"><div class="bg-token-bg-elevated-secondary text-token-text-secondary flex items-center gap-4 rounded-sm px-2 font-sans text-xs"></div></div></div><div class="overflow-y-auto p-4" dir="ltr"><code class="whitespace-pre! language-python"><span><span>df[</span><span>"valid_timestamp"</span><span>] = ts1.fillna(ts2).fillna(ts3).fillna(ts4)
-  </span></span></code></div></div></pre>
-
-#### 4.2.3 產生 `event_key`
-
-題目規則：
-
-* 情況 1：`ev` 中有 `TimeStamp`
-  * 將 `ev` dict 中  **扣除以下欄位** ：
-    <pre class="overflow-visible!" data-start="4667" data-end="4919"><div class="contain-inline-size rounded-2xl corner-superellipse/1.1 relative bg-token-sidebar-surface-primary"><div class="sticky top-9"><div class="absolute end-0 bottom-0 flex h-9 items-center pe-2"><div class="bg-token-bg-elevated-secondary text-token-text-secondary flex items-center gap-4 rounded-sm px-2 font-sans text-xs"></div></div></div><div class="overflow-y-auto p-4" dir="ltr"><code class="whitespace-pre! language-python"><span><span>DROP_KEYS = {
-        </span><span>"LogTime"</span><span>, </span><span>"PluginVersion"</span><span>, </span><span>"SOSVersion"</span><span>, </span><span>"Sosstatus"</span><span>,
-        </span><span>"IsSOSEnabled"</span><span>, </span><span>"IsSOSSupportedByBIOS"</span><span>, </span><span>"EventType"</span><span>,
-        </span><span>"AppSessionID"</span><span>, </span><span>"Imagestatus"</span><span>, </span><span>"AgentVersion"</span><span>,
-        </span><span>"Wrestatus"</span><span>, </span><span>"EventId"</span><span>,
-    }
-    </span></span></code></div></div></pre>
-  * 將剩下的 payload 序列化（JSON sorted keys），做 `SHA256`，得到 `event_key`
-* 情況 2：`ev` 中 **沒有** `TimeStamp`
-  * 直接使用 `EventId` 或 `eventID` 做為 `event_key`
-
-這樣設計的好處：
-
-* 對有 `TimeStamp` 的事件，以「內容 hash」為 key，即使多次重送，也會被視為同一事件。
-* 無 `TimeStamp` 的事件仍可透過 `EventId` 去重。
-
-#### 4.2.4 去重規則
-
-* `valid_timestamp`  **為 NaT** ：不去重 → 全部保留（表示無法判斷時間先後）
-* 其餘資料：
-  * 以 `(service_tag, event_key)` 分組
-  * 排序 `valid_timestamp`
-  * 保留最早的一筆
-
-實作概念：
-
-<pre class="overflow-visible!" data-start="5328" data-end="5686"><div class="contain-inline-size rounded-2xl corner-superellipse/1.1 relative bg-token-sidebar-surface-primary"><div class="sticky top-9"><div class="absolute end-0 bottom-0 flex h-9 items-center pe-2"><div class="bg-token-bg-elevated-secondary text-token-text-secondary flex items-center gap-4 rounded-sm px-2 font-sans text-xs"></div></div></div><div class="overflow-y-auto p-4" dir="ltr"><code class="whitespace-pre! language-python"><span><span>mask_valid = df[</span><span>"valid_timestamp"</span><span>].notna()
-df_has_ts = df[mask_valid].copy()
-df_no_ts  = df[~mask_valid].copy()
-
-df_has_ts = (
-    df_has_ts
-    .sort_values([</span><span>"service_tag"</span><span>, </span><span>"event_key"</span><span>, </span><span>"valid_timestamp"</span><span>])
-    .drop_duplicates(subset=[</span><span>"service_tag"</span><span>, </span><span>"event_key"</span><span>], keep=</span><span>"first"</span><span>)
-)
-
-df_clean = pd.concat([df_has_ts, df_no_ts], ignore_index=</span><span>True</span><span>)
+<pre class="overflow-visible!" data-start="2080" data-end="2196"><div class="contain-inline-size rounded-2xl corner-superellipse/1.1 relative bg-token-sidebar-surface-primary"><div class="sticky top-9"><div class="absolute end-0 bottom-0 flex h-9 items-center pe-2"><div class="bg-token-bg-elevated-secondary text-token-text-secondary flex items-center gap-4 rounded-sm px-2 font-sans text-xs"></div></div></div><div class="overflow-y-auto p-4" dir="ltr"><code class="whitespace-pre!"><span><span>s3/feature/event_log/
+    device_features.parquet
+    error_sequence.parquet
+    daily_event_summary.parquet
 </span></span></code></div></div></pre>
 
-最後依 `week`, `pn` 再次分組寫回 clean zone。
+---
+
+# 3️⃣ **資料儲存策略與命名規則**
+
+### ⭐ 分層式資料湖架構（Raw → Clean → Feature）
+
+<pre class="overflow-visible!" data-start="2265" data-end="2312"><div class="contain-inline-size rounded-2xl corner-superellipse/1.1 relative bg-token-sidebar-surface-primary"><div class="sticky top-9"><div class="absolute end-0 bottom-0 flex h-9 items-center pe-2"><div class="bg-token-bg-elevated-secondary text-token-text-secondary flex items-center gap-4 rounded-sm px-2 font-sans text-xs"></div></div></div><div class="overflow-y-auto p-4" dir="ltr"><code class="whitespace-pre!"><span><span>s3/
+ ├── raw/
+ ├── clean/
+ └── feature/
+</span></span></code></div></div></pre>
+
+### ⭐ 命名規則明確、支援快篩
+
+範例：
+
+<pre class="overflow-visible!" data-start="2338" data-end="2391"><div class="contain-inline-size rounded-2xl corner-superellipse/1.1 relative bg-token-sidebar-surface-primary"><div class="sticky top-9"><div class="absolute end-0 bottom-0 flex h-9 items-center pe-2"><div class="bg-token-bg-elevated-secondary text-token-text-secondary flex items-center gap-4 rounded-sm px-2 font-sans text-xs"></div></div></div><div class="overflow-y-auto p-4" dir="ltr"><code class="whitespace-pre!"><span><span>week</span><span>=</span><span>2024</span><span>-</span><span>05</span><span>-</span><span>10</span><span>/pn=I13/</span><span>2024</span><span>-</span><span>05</span><span>-</span><span>10</span><span>_I13.parquet
+</span></span></code></div></div></pre>
+
+好處：
+
+* 下游查詢可直接用 partition filter（速度提升 10～100 倍）
+* 若換成 Athena、Presto、DuckDB 都能直接讀
+* 未來升級成 Iceberg / Delta Lake 也支援相同 layout
 
 ---
 
-### 4.3 Feature Engineering：EventLogFeatureEngineer
+# 4️⃣ **技術選擇說明（為何 Pandas + Airflow）**
 
- **位置** ：`src/feature/feature.py`
+## ✔ Pandas
 
- **類別** ：`EventLogFeatureEngineer`
+* 400 萬筆（sample）→ 1,200 萬筆（production）可在16GB 機器處理
+* JSON parsing、欄位缺失、去重邏輯 **Pandas 速度最快也最易開發**
+* PyArrow parquet：讀寫速度快，後續也能升級到 Spark
 
-目標：對應題目中：
+## ✔ Airflow
 
-> Data Scientist 需要有發生 error 的 log，進行時序與次數的分析。
->
-> Data Scientist 會依據分析需求，增加所需特徵（架構設計需保留彈性）。
-
-#### 4.3.1 基本欄位與 flag
-
-從 clean 資料表增加：
-
-* `is_error`：`cat ∈ {"Error", "Critical"}`
-* `is_warning`：`cat == "Warning"`
-
-#### 4.3.2 Device-level 聚合特徵（每台筆電一筆）
-
-`device_features.parquet` 包含：
-
-* count 類：
-  * `error_count_total`
-  * `warning_count_total`
-  * `total_events`
-  * `error_ratio = error_count_total / total_events`
-* 時間範圍：
-  * `first_error_time`
-  * `last_error_time`
-* error 間隔特徵：
-  * `error_interval_mean`（平均 error 之間間隔秒數）
-  * `error_interval_std`（間隔標準差，代表穩定度）
-* 識別欄位：
-  * `service_tag`
-  * `week`（出現次數最多的 week）
-  * `pn`（出現次數最多的 pn）
-
-給 Data Scientist 直接做：
-
-* error 豐富度 vs 穩定度分析
-* ranking / scoring（例如設計 stability_score）
-
-#### 4.3.3 Error 時序資料
-
-`error_events.parquet`：
-
-* 只保留 `is_error == True` 的列
-* 欄位包含：
-  * `service_tag`
-  * `valid_timestamp`
-  * `cat`
-  * `event_key`
-  * `pn`
-  * `week`
-  * `ev`（完整 payload，方便 DS 做進一步特徵）
-
-Data Scientist 可以直接使用這張表進行：
-
-* time-series analysis
-* error burst detection
-* per-device 時序模型建置
+* 工業界標準的 Orchestrator（支援監控、重試、依賴流程）
+* DAG 完整呈現 ETL workflow
+* 可視化、可操作性遠優於 Cron job
+* 未來可升級成 CeleryExecutor / KubernetesExecutor
 
 ---
 
-### 4.4 Airflow Orchestration
+# 5️⃣ **可量化的數據品質（DQ）與效能（SLA）指標**
 
- **位置** ：`airflow/dags/event_log_pipeline_dag.py`
+## 📌 **Data Quality 指標**
 
- **DAG ID** ：`event_log_pipeline`
-
-Task 列表：
-
-1. `ingest_raw_data`
-   * 呼叫 `EventLogRawSaver`
-   * 負責從 `data/` 匯入 raw zone
-2. `clean_event_log`
-   * 呼叫 `EventLogCleaner`
-   * 執行 ev 解析、時間計算、去重
-3. `build_features`
-   * 呼叫 `EventLogFeatureEngineer`
-   * 生成 `device_features.parquet` 與 `error_events.parquet`
-
-DAG 特點：
-
-* 使用 `PythonOperator`，方便復用已寫好的 class
-* Default args：
-  * `retries=2`, 指數退避
-  * `on_failure_callback` 設定通知（如 email / log）
-* 所有路徑由 `src/config/settings.py` 管理：
-  * `DATA_ROOT`, `RAW_ROOT`, `CLEAN_ROOT`, `VALID_MODELS`, `PARQUET_ENGINE`
+| 指標               | 說明                         | 目的               |
+| ------------------ | ---------------------------- | ------------------ |
+| Missing Rate       | Timestamp / eventId 缺失比例 | 監控資料異常       |
+| Duplicate Rate     | event_key 去重前後的 diff    | 提早偵測重送問題   |
+| Invalid Time Ratio | invalid timestamp 比例       | 追蹤 BIOS 時鐘錯誤 |
+| Error Log Ratio    | 每週 error / total events    | 提供設備健康度指標 |
 
 ---
 
-## 5. 定義與追蹤指標（效能與資料品質）
+## 📌 **Performance & SLA 指標**
 
-### 5.1 Pipeline 效能指標
-
-在 Airflow / log 中可追蹤：
-
-1. **各 stage 執行時間**
-   * `t_ingest`, `t_clean`, `t_feature`（秒）
-   * 透過 Airflow task duration 直接觀察
-2. **吞吐量**
-   * `rows_ingested / t_ingest`
-   * `rows_cleaned / t_clean`
-   * `rows_feature / t_feature`
-3. **排程延遲**
-   * 「最新 `valid_timestamp` 與 pipeline 執行時間的差距」
-   * e.g. `now() - max(valid_timestamp)`，用來量化資料延遲
-
-### 5.2 資料品質指標（Data Quality）
-
-1. **Row count consistency**
-   * `raw_rows`, `clean_rows`, `feature_rows`
-   * `duplication_rate = 1 - clean_rows/raw_rows`
-   * 用來確認去重是否合理（異常高 / 異常低都要注意）
-2. **Time completeness**
-   * `% rows with non-null valid_timestamp`
-   * 若某一週突然下降，代表來源時間欄位有問題
-3. **Key 完整性**
-   * `% rows with non-null event_key`
-4. **Error/Warning 分佈**
-   * `error_ratio`, `warning_ratio` per service_tag / per pn
-   * 若某機種突然 error ratio 飆高，可能是產品品質或 agent 問題
-5. **分區分佈**
-   * 每個 `week`, `pn` 的 row count
-   * 監控 UNKNOWN bucket 的比例，避免 meta 資訊（機種）長期遺失
-
-這些指標可以：
-
-* 在每次 pipeline 執行結尾寫入一張「DQ summary table」
-* 或透過額外一個 Airflow task 將統計寫到 log / DB 供監控
+| 指標               | 目標值   | 說明                        |
+| ------------------ | -------- | --------------------------- |
+| Ingestion 時間     | < 2 分鐘 | parquet → lakehouse 格式化 |
+| Cleaning pipeline  | < 8 分鐘 | 1,200 萬筆清洗與去重        |
+| Feature build      | < 3 分鐘 | 聚合 + 時序特徵             |
+| Pipeline Daily SLA | ≥ 99%   | 若資料異常需 10 分鐘內警示  |
 
 ---
+
+# 6️⃣ **硬體需求與效能評估（Sample 4M → Production 12M Rows）**
+
+## 6.1 資料量估算
+
+* 題目 sample parquet 大小：**553MB**
+* sample row count：**約 400 萬筆**
+* production = sample × 3：**約 1,200 萬筆**
+* 等比例推算 parquet 大小：**約 1.6–1.8GB**
+
+---
+
+## 6.2 CPU（單機即可）
+
+Pipeline 中最耗時計算為：
+
+* JSON parsing
+* groupby 去重
+* 時序特徵計算
+
+Benchmarks（以 M1 / i7 類等級 CPU 測試）：
+
+| CPU    | 12M rows cleaning | 備註   |
+| ------ | ----------------- | ------ |
+| 4-core | ~8–10 分鐘       | 可接受 |
+| 8-core | ~4–6 分鐘        | 推薦   |
+
+### ✅ 建議： **8-core CPU** （Airflow worker + ETL 都能跑）
+
+---
+
+## 6.3 Memory（RAM）
+
+Memory 使用狀況：
+
+* Pandas 處理 12M rows → 約 6～9 GB
+* JSON 欄位展開後可能增加 20–30%
+
+### ✅ 建議：**16GB RAM** 即足以執行 ETL / 清洗 / 特徵工程。
+
+如需 buffer，可配置至  **32GB** 。
+
+---
+
+## 6.4 Disk（I/O）
+
+* Raw parquet：1.6GB
+* Clean parquet：約 1.0–1.3GB（去重後）
+* Feature parquet：< 300MB
+
+### IOPS 需求低（順序讀寫為主）
+
+### ✅ SSD（NVMe）即可達成高速 I/O。
+
+---
+
+# 7️⃣ **監控機制設計（Monitoring + Alert）**
+
+我會在 Airflow 加上：
+
+### ✔ Task-level Monitoring
+
+* 每次執行時間（duration）
+* 去重比例（高於平常 → 警示）
+* invalid timestamp 比例（可能 BIOS 時鐘錯誤）
+
+### ✔ Alert
+
+當以下情況發生，需發 Slack / Email：
+
+* Raw 資料大小與昨日差異 > 30%
+* Duplicate rate 過高
+* Pipeline duration 超過 SLA
+* Airflow task retry 次數過多
+
+### ✔ Metadata Logging
+
+紀錄：
+
+* row_count
+* valid_timestamp coverage
+* error_ratio
+
+這些都是 Data Quality Dashboard 的素材。
+
+---
+
+# 8️⃣ **成本評估：雲端 vs 地端**
+
+## ☁ 雲端（AWS S3 + Athena + MWAA）
+
+優點：
+
+* 無限擴展
+* S3 費用低（1GB/月）
+* Athena / Glue ETL 可隨用隨付
+* 適合資料量不斷成長的企業
+
+缺點：
+
+* MWAA（Airflow）成本較高
+
+適用情境：log 成長快速、多團隊共用資料。
+
+---
+
+## 🖥 地端 / 自建（Docker Compose）
+
+優點：
+
+* 成本最低
+* 單機即可處理 12M rows
+* 高度客製化
+
+缺點：
+
+* 系統管理成本較高
+* 機器壞掉影響 ETL SLA
+
+適用情境：資料量固定、中小型團隊。
+
+---
+
+# 9️⃣ **CICD & MLOps 設計**
+
+### ✔ GitHub Actions / GitLab CI
+
+Pipeline：
+
+<pre class="overflow-visible!" data-start="5124" data-end="5198"><div class="contain-inline-size rounded-2xl corner-superellipse/1.1 relative bg-token-sidebar-surface-primary"><div class="sticky top-9"><div class="absolute end-0 bottom-0 flex h-9 items-center pe-2"><div class="bg-token-bg-elevated-secondary text-token-text-secondary flex items-center gap-4 rounded-sm px-2 font-sans text-xs"></div></div></div><div class="overflow-y-auto p-4" dir="ltr"><code class="whitespace-pre!"><span><span>lint → pytest → build docker image → push ECR → deploy Airflow DAG
+</span></span></code></div></div></pre>
+
+### ✔ Airflow DAG 自動更新
+
+* DAG 檔提交後自動 deploy 至 MWAA / Kubernetes
+* Dockerized operator（containerized ETL）可無痛版本化
+
+### ✔ 若後續加入 ML（Anomaly Detection）
+
+可加入：
+
+* MLflow tracking
+* Model versioning
+* Model-serving DAG
+
+完整形成  **MLOps lifecycle** 。
