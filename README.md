@@ -99,19 +99,53 @@
 
 ### **(3) Feature Engineering（Feature Zone）**
 
-Data Scientist 需要：
+ **目標** ：為 Data Scientist 提供兩種資料：
 
-* 有 Error 的事件
-* 時序特徵（事件時間差、Error 次數）
-* 設備層級特徵（每日 / 每週 event count）
+1. 每台設備的整體健康度特徵（device-level features）
+2. 只包含 error 的時序事件表（error-only time series）
 
-我輸出三種特徵檔：
+**輸出兩個檔案：**
 
-<pre class="overflow-visible!" data-start="2080" data-end="2196"><div class="contain-inline-size rounded-2xl corner-superellipse/1.1 relative bg-token-sidebar-surface-primary"><div class="sticky top-9"><div class="absolute end-0 bottom-0 flex h-9 items-center pe-2"><div class="bg-token-bg-elevated-secondary text-token-text-secondary flex items-center gap-4 rounded-sm px-2 font-sans text-xs"></div></div></div><div class="overflow-y-auto p-4" dir="ltr"><code class="whitespace-pre!"><span><span>s3/feature/event_log/
+<pre class="overflow-visible!" data-start="3586" data-end="3672"><div class="contain-inline-size rounded-2xl corner-superellipse/1.1 relative bg-token-sidebar-surface-primary"><div class="sticky top-9"><div class="absolute end-0 bottom-0 flex h-9 items-center pe-2"><div class="bg-token-bg-elevated-secondary text-token-text-secondary flex items-center gap-4 rounded-sm px-2 font-sans text-xs"></div></div></div><div class="overflow-y-auto p-4" dir="ltr"><code class="whitespace-pre! language-text"><span><span>s3/feature/event_log/
     device_features.parquet
-    error_sequence.parquet
-    daily_event_summary.parquet
+    error_events.parquet
 </span></span></code></div></div></pre>
+
+#### a. `device_features.parquet`（每台 service_tag 一筆）
+
+對 clean 資料以 `service_tag` 聚合：
+
+* `total_events`：總事件數
+* `error_count_total`：Error 事件數
+* `warning_count_total`：Warning 事件數
+* `error_ratio = error_count_total / total_events`
+* `first_error_time`, `last_error_time`
+* `error_interval_mean`, `error_interval_std`
+  * 依 `valid_timestamp` 排序，計算 error 之間的時間差
+* `dominate_pn`, `dominate_week`
+  * 該設備最常出現的機種 / 週期（mode）
+
+這張表可以直接用來計算：
+
+* 設備健康分數（stability score）
+* 找出 error 比例異常高的裝置。
+
+#### b. `error_events.parquet`（只保留 error log）
+
+* 僅保留 `cat` 屬於 Error / Critical 的事件。
+* 欄位包含：
+  * `service_tag`
+  * `valid_timestamp`
+  * `event_key`
+  * `pn`, `week`
+  * `cat`
+  * `ev`（原始 JSON 字串／dict）
+
+Data Scientist 可以用這張表做：
+
+* 時序分析（per device / per pn）
+* error burst / spike detection
+* 後續模型訓練（sequence model, anomaly detection）
 
 ---
 
