@@ -1,0 +1,85 @@
+version: "3.8"
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: ce-airflow-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+      TZ: Asia/Taipei
+    volumes:
+      - ./pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  airflow:
+    build:
+      context: ..                     # 專案根：CE_interview
+      dockerfile: airflow/Dockerfile
+    container_name: ce-airflow
+    restart: unless-stopped
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    ports:
+      - "8080:8080"                   # Web UI
+
+    environment:
+      # 基本設定
+      AIRFLOW_HOME: /opt/airflow
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "False"
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      AIRFLOW__CORE__DEFAULT_TIMEZONE: Asia/Taipei
+
+      # DB 設定：用 Postgres 當 metadata DB
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+
+      # 若未來改 CeleryExecutor，可沿用這個 result backend
+      AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflow:airflow@postgres:5432/airflow
+
+      # 時區
+      TZ: Asia/Taipei
+
+    # 掛載專案、DAG、logs、plugins
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./logs:/opt/airflow/logs
+      - ./plugins:/opt/airflow/plugins
+      - ..:/opt/airflow/app              # CE_interview → /opt/airflow/app
+
+    # 啟動流程：
+    # 1) airflow db upgrade
+    # 2) 建立 admin 帳號（已存在就忽略錯誤）
+    # 3) 啟動 webserver + scheduler
+    command: >
+      bash -c '
+        echo "[INIT] airflow db upgrade";
+        airflow db upgrade;
+
+        echo "[INIT] ensure admin user exists";
+        if ! airflow users list | grep -q "^admin "; then
+          airflow users create \
+            --username admin \
+            --password admin \
+            --firstname Admin \
+            --lastname User \
+            --role Admin \
+            --email admin@example.com;
+        else
+          echo "[INIT] admin user already exists, skip create";
+        fi
+
+        echo "[INIT] start webserver & scheduler";
+        airflow webserver --port 8080 &
+
+        airflow scheduler
+      '
