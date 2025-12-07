@@ -4,6 +4,7 @@ import pyarrow.parquet as pq
 import pyarrow as pa
 import pandas as pd
 from typing import Iterable, Set, Optional
+
 ROOT = Path(__file__).resolve().parents[2]
 
 if str(ROOT) not in sys.path:
@@ -95,11 +96,10 @@ class EventLogRawIngestor:
         print(f"  wrote pn={pn_value} -> {dest_path}")
 
 
-# 直接執行這支檔案時用
 if __name__ == "__main__":
     saver = EventLogRawIngestor(
-        src_root="data",
-        dst_root="s3/raw/event_log",
+        src_root=DATA_ROOT,
+        dst_root=RAW_ROOT,
         valid_models={"I13", "L5", "DG5"},
     )
     saver.run()

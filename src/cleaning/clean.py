@@ -170,13 +170,10 @@ class EventLogCleaner:
             print("Saved:", out_path)
 
 
-# ------------------------------------------------------------
-# script 入口：給你 local 跑，也給 Airflow / CLI 用
-# ------------------------------------------------------------
 if __name__ == "__main__":
     cleaner = EventLogCleaner(
-        raw_root="s3/raw/event_log",
-        clean_root="s3/clean/event_log",
-        parquet_engine="fastparquet",
+        raw_root=RAW_ROOT,
+        clean_root=CLEAN_ROOT,
+        parquet_engine=PARQUET_ENGINE,
     )
     cleaner.run()
