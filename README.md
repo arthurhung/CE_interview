@@ -7,8 +7,8 @@
                                │
                                ▼
         ┌──────────────────────────────────────────────┐
-        │                 Ingestion Layer               │
-        │     EventLogRawSaver                         │
+        │                 Ingestion Layer              │
+        │     EventLogRawIngestor                      │
         │     Partition → week / pn                    │
         │     Output → s3/raw/event_log/               │
         └──────────────────────────────────────────────┘
