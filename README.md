@@ -15,25 +15,25 @@
                                │
                                ▼
         ┌──────────────────────────────────────────────┐
-        │                    Raw Zone                   │
-        │   week=2024-05-10/pn=I13/*.parquet            │
-        │   Hive-style partitioning                     │
+        │                    Raw Zone                  │
+        │   week=2024-05-10/pn=I13/*.parquet           │
+        │   Hive-style partitioning                    │
         └──────────────────────────────────────────────┘
                                │
                                ▼
         ┌──────────────────────────────────────────────┐
-        │                Cleaning Layer                 │
-        │      EventLogCleaner                          │
-        │  JSON parsing / timestamp resolution          │
-        │  dedup by event_key + service_tag             │
-        │  Output → s3/clean/event_log/                 │
+        │                Cleaning Layer                │
+        │      EventLogCleaner                         │
+        │  JSON parsing / timestamp resolution         │
+        │  dedup by event_key + service_tag            │
+        │  Output → s3/clean/event_log/                │
         └──────────────────────────────────────────────┘
                                │
                                ▼
         ┌──────────────────────────────────────────────┐
-        │                Feature Layer                  │
-        │     EventLogFeatureEngineer                   │
-        │   ✔ device_features.parquet                   │
+        │                Feature Layer                 │
+        │     EventLogFeatureEngineer                  │
+        │   ✔ device_features.parquet                  │
         │   ✔ error_events.parquet                     │
         │   Output → s3/feature/event_log/             │
         └──────────────────────────────────────────────┘
